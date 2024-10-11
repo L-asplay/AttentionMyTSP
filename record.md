@@ -128,10 +128,10 @@ class GraphAttentionEncoder(nn.Module):
         # Batch multiply to get initial embeddings of nodes
         h = self.init_embed(x.view(-1, x.size(-1))).view(*x.size()[:2], -1) if self.init_embed is not None else x
 
-        graph_size = len(h[0])
+        graph_size = h.size()[1]
 
         h1 = h[:,:graph_size-self.order_size]
-        h2 = h[:,:graph_size-self.order_size:]
+        h2 = h[:,graph_size-self.order_size:]
 
         h1 = self.layers1(h1)
         h2 = self.layers2(h2)
@@ -144,6 +144,7 @@ class GraphAttentionEncoder(nn.Module):
             h,  # (batch_size, graph_size, embed_dim)
             h.mean(dim=1),  # average to get embedding of graph, (batch_size, embed_dim)
         )
+
 ```
 
 2. class MultiHeadAttentionLayer
@@ -252,7 +253,7 @@ class MultiHeadAttention(nn.Module):
         shp = (self.n_heads, batch_size, graph_size, -1)
         shp_q = (self.n_heads, batch_size, n_query, -1)
 
-        # Calculate queries, (n_heads, batch_size, n_query, key/val_size)
+        # Calculate queries, (n_heads, n_query, graph_size ,key/val_size)
         Q = torch.matmul(qflat, self.W_query).view(shp_q)
         # Calculate keys and values (n_heads, batch_size, graph_size, key/val_size)
         K = torch.matmul(hflat, self.W_key).view(shp)
@@ -264,7 +265,8 @@ class MultiHeadAttention(nn.Module):
         w_r = torch.ones(graph_size,graph_size) 
         if self.order_size > 0 and self.lr_encode != 1.0 :
            w_r = torch.matmul(w_l_r.unsqueeze(1),w_l_r.unsqueeze(0))
-        W_r = w_r.unsqueeze(0).unsqueeze(0).repeat(self.n_heads, batch_size, 1, 1)
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        W_r = w_r.unsqueeze(0).unsqueeze(0).repeat(self.n_heads, batch_size, 1, 1).to(device)
 
         # Calculate compatibility (n_heads, batch_size, n_query, graph_size)
         compatibility = self.norm_factor * torch.matmul(Q, K.transpose(2, 3))
@@ -302,3 +304,4 @@ class MultiHeadAttention(nn.Module):
         return out
 ```
 
+### 
