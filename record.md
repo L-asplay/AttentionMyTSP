@@ -1,0 +1,297 @@
+record of changes
+
+### 1. pretrained/tsp_20/args.json
+1. 添加新参数 order_size 
+    每次指定生成点队列的最后 order_size个有优先级顺序
+2. 添加新参数 lr_encode
+    在 attention 实现优先偏置 W_r 的参数
+    ~ $C^{eln(\frac{o}{g}+1)}$
+3. 添加新参数 sub_encode_layers
+    设置 sub_encode 的堆叠层数
+
+epoch_size: 1280000 -> 128000
+
+### 2. options.py
+1. model方面,添加新的 args 设置
+
+epoch_size: 1280000 -> 12800
+
+### 3. nets/attention_model.py/class AttentionModel
+1. __init__()
+```py
+    def __init__(self,
+                 embedding_dim,
+                 hidden_dim,
+                 problem,
+                 n_encode_layers=2,
+
+                 order_size=0,
+                 lr_encode=1.0,
+                 sub_encode_layers=0,
+
+                 tanh_clipping=10.,
+                 mask_inner=True,
+                 mask_logits=True,
+                 normalization='batch',
+                 n_heads=8,
+                 checkpoint_encoder=False,
+                 shrink_size=None):
+        super(AttentionModel, self).__init__()
+
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
+        self.n_encode_layers = n_encode_layers
+
+        self.order_size=order_size
+        self.lr_encode=lr_encode
+        self.sub_encode_layers=sub_encode_layers
+
+        self.decode_type = None
+        self.temp = 1.0
+        self.allow_partial = problem.NAME == 'sdvrp'
+        self.is_vrp = problem.NAME == 'cvrp' or problem.NAME == 'sdvrp'
+        self.is_orienteering = problem.NAME == 'op'
+        self.is_pctsp = problem.NAME == 'pctsp'
+
+        self.tanh_clipping = tanh_clipping
+
+        self.mask_inner = mask_inner
+        self.mask_logits = mask_logits
+
+        self.problem = problem
+        self.n_heads = n_heads
+        self.checkpoint_encoder = checkpoint_encoder
+        self.shrink_size = shrink_size
+
+        self.embedder = GraphAttentionEncoder(
+            n_heads=n_heads,
+            embed_dim=embedding_dim,
+            n_layers=self.n_encode_layers,
+
+            order_size=self.order_size,
+            lr_encode=self.lr_encode,
+            sub_layers=self.sub_encode_layers,
+
+            normalization=normalization
+        )
+        # Remianing
+
+```
+2. Remaining: decode 中的 attention 维持原来的方案
+   
+### 4. graph_encoder.py
+1. class GraphAttentionEncoder
+```py
+class GraphAttentionEncoder(nn.Module):
+    def __init__(
+            self,
+            n_heads,
+            embed_dim,
+            n_layers,
+
+            order_size,
+            lr_encode,
+            sub_layers,
+
+            node_dim=None,
+            normalization='batch',
+            feed_forward_hidden=512
+    ):
+        super(GraphAttentionEncoder, self).__init__()
+
+        # To map input to embedding space
+        self.init_embed = nn.Linear(node_dim, embed_dim) if node_dim is not None else None
+        
+        self.order_size = order_size
+
+        self.layers1 = nn.Sequential(*(
+            MultiHeadAttentionLayer(n_heads, embed_dim, feed_forward_hidden, normalization)
+            for _ in range(sub_layers)
+        ))
+        
+        self.layers2 = nn.Sequential(*(
+            MultiHeadAttentionLayer(n_heads, embed_dim, feed_forward_hidden, normalization,
+            order_size,lr_encode)
+            for _ in range(sub_layers)
+       ))
+
+        self.layers = nn.Sequential(*(
+            MultiHeadAttentionLayer(n_heads, embed_dim, feed_forward_hidden, normalization,
+            order_size,lr_encode)
+            for _ in range(n_layers-sub_layers)
+        ))
+
+    def forward(self, x, mask=None):
+
+        assert mask is None, "TODO mask not yet supported!"
+
+        # Batch multiply to get initial embeddings of nodes
+        h = self.init_embed(x.view(-1, x.size(-1))).view(*x.size()[:2], -1) if self.init_embed is not None else x
+
+        graph_size = len(h[0])
+
+        h1 = h[:,:graph_size-self.order_size]
+        h2 = h[:,:graph_size-self.order_size:]
+
+        h1 = self.layers1(h1)
+        h2 = self.layers2(h2)
+           
+        h = torch.cat((h1, h2), dim=1)
+
+        h = self.layers(h)
+
+        return (
+            h,  # (batch_size, graph_size, embed_dim)
+            h.mean(dim=1),  # average to get embedding of graph, (batch_size, embed_dim)
+        )
+```
+
+2. class MultiHeadAttentionLayer
+```py
+class MultiHeadAttentionLayer(nn.Sequential):
+
+    def __init__(
+            self,
+            n_heads,
+            embed_dim,
+            feed_forward_hidden=512,
+            normalization='batch',
+            order_size=0,
+            lr_encode=1.0
+    ):
+        super(MultiHeadAttentionLayer, self).__init__(
+            SkipConnection(
+                MultiHeadAttention(
+                    n_heads,
+                    input_dim=embed_dim,
+                    embed_dim=embed_dim,
+                    order_size=order_size,
+                    lr_encode=lr_encode
+                )
+            ),
+            Normalization(embed_dim, normalization),
+            SkipConnection(
+                nn.Sequential(
+                    nn.Linear(embed_dim, feed_forward_hidden),
+                    nn.ReLU(),
+                    nn.Linear(feed_forward_hidden, embed_dim)
+                ) if feed_forward_hidden > 0 else nn.Linear(embed_dim, embed_dim)
+            ),
+            Normalization(embed_dim, normalization)
+        )
+```
+
+3. class MultiHeadAttention
+```py
+class MultiHeadAttention(nn.Module):
+    def __init__(
+            self,
+            n_heads,
+            input_dim,
+            embed_dim,
+            order_size=0,
+            lr_encode=1.0,
+            val_dim=None,
+            key_dim=None
+    ):
+        super(MultiHeadAttention, self).__init__()
+
+        if val_dim is None:
+            val_dim = embed_dim // n_heads
+        if key_dim is None:
+            key_dim = val_dim
+
+        self.n_heads = n_heads
+        self.input_dim = input_dim
+        self.embed_dim = embed_dim
+        self.val_dim = val_dim
+        self.key_dim = key_dim
+
+        self.order_szie = order_szie
+        self.lr_encode = lr_encode
+
+        self.norm_factor = 1 / math.sqrt(key_dim)  # See Attention is all you need
+
+        self.W_query = nn.Parameter(torch.Tensor(n_heads, input_dim, key_dim))
+        self.W_key = nn.Parameter(torch.Tensor(n_heads, input_dim, key_dim))
+        self.W_val = nn.Parameter(torch.Tensor(n_heads, input_dim, val_dim))
+
+        self.W_out = nn.Parameter(torch.Tensor(n_heads, val_dim, embed_dim))
+
+        self.init_parameters()
+
+    def init_parameters(self):
+
+        for param in self.parameters():
+            stdv = 1. / math.sqrt(param.size(-1))
+            param.data.uniform_(-stdv, stdv)
+
+    def forward(self, q, h=None, mask=None):
+        """
+
+        :param q: queries (batch_size, n_query, input_dim)
+        :param h: data (batch_size, graph_size, input_dim)
+        :param mask: mask (batch_size, n_query, graph_size) or viewable as that (i.e. can be 2 dim if n_query == 1)
+        Mask should contain 1 if attention is not possible (i.e. mask is negative adjacency)
+        :return:
+        """
+        if h is None:
+            h = q  # compute self-attention
+
+        # h should be (batch_size, graph_size, input_dim)
+        batch_size, graph_size, input_dim = h.size()
+        n_query = q.size(1)
+        assert q.size(0) == batch_size
+        assert q.size(2) == input_dim
+        assert input_dim == self.input_dim, "Wrong embedding dimension of input"
+
+        hflat = h.contiguous().view(-1, input_dim)
+        qflat = q.contiguous().view(-1, input_dim)
+
+        # last dimension can be different for keys and values
+        shp = (self.n_heads, batch_size, graph_size, -1)
+        shp_q = (self.n_heads, batch_size, n_query, -1)
+
+        # Calculate queries, (n_heads, n_query, graph_size, key/val_size)
+        Q = torch.matmul(qflat, self.W_query).view(shp_q)
+        # Calculate keys and values (n_heads, batch_size, graph_size, key/val_size)
+        K = torch.matmul(hflat, self.W_key).view(shp)
+        V = torch.matmul(hflat, self.W_val).view(shp)
+
+        # Calculate compatibility (n_heads, batch_size, n_query, graph_size)
+        compatibility = self.norm_factor * torch.matmul(Q, K.transpose(2, 3))
+
+        # Optionally apply mask to prevent attention
+        if mask is not None:
+            mask = mask.view(1, batch_size, n_query, graph_size).expand_as(compatibility)
+            compatibility[mask] = -np.inf
+
+        attn = torch.softmax(compatibility, dim=-1)
+
+        # If there are nodes with no neighbours then softmax returns nan so we fix them to 0
+        if mask is not None:
+            attnc = attn.clone()
+            attnc[mask] = 0
+            attn = attnc
+
+        heads = torch.matmul(attn, V)
+
+        out = torch.mm(
+            heads.permute(1, 2, 0, 3).contiguous().view(-1, self.n_heads * self.val_dim),
+            self.W_out.view(-1, self.embed_dim)
+        ).view(batch_size, n_query, self.embed_dim)
+
+        # Alternative:
+        # headst = heads.transpose(0, 1)  # swap the dimensions for batch and heads to align it for the matmul
+        # # proj_h = torch.einsum('bhni,hij->bhnj', headst, self.W_out)
+        # projected_heads = torch.matmul(headst, self.W_out)
+        # out = torch.sum(projected_heads, dim=1)  # sum across heads
+
+        # Or:
+        # out = torch.einsum('hbni,hij->bnj', heads, self.W_out)
+
+        return out
+
+
+```
+
