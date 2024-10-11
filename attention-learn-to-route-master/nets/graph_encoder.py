@@ -24,7 +24,6 @@ class MultiHeadAttention(nn.Module):
             lr_encode=1.0,
             val_dim=None,
             key_dim=None
-            
     ):
         super(MultiHeadAttention, self).__init__()
 
@@ -39,6 +38,9 @@ class MultiHeadAttention(nn.Module):
         self.val_dim = val_dim
         self.key_dim = key_dim
 
+        self.order_size = order_size
+        self.lr_encode = lr_encode
+
         self.norm_factor = 1 / math.sqrt(key_dim)  # See Attention is all you need
 
         self.W_query = nn.Parameter(torch.Tensor(n_heads, input_dim, key_dim))
@@ -46,7 +48,7 @@ class MultiHeadAttention(nn.Module):
         self.W_val = nn.Parameter(torch.Tensor(n_heads, input_dim, val_dim))
 
         self.W_out = nn.Parameter(torch.Tensor(n_heads, val_dim, embed_dim))
-
+        
         self.init_parameters()
 
     def init_parameters(self):
@@ -81,14 +83,23 @@ class MultiHeadAttention(nn.Module):
         shp = (self.n_heads, batch_size, graph_size, -1)
         shp_q = (self.n_heads, batch_size, n_query, -1)
 
-        # Calculate queries, (n_heads, n_query, graph_size, key/val_size)
+        # Calculate queries, (n_heads, batch_size, n_query, key/val_size)
         Q = torch.matmul(qflat, self.W_query).view(shp_q)
         # Calculate keys and values (n_heads, batch_size, graph_size, key/val_size)
         K = torch.matmul(hflat, self.W_key).view(shp)
         V = torch.matmul(hflat, self.W_val).view(shp)
+        
+        w_l_r = torch.ones(graph_size)  
+        if self.order_size > 0 and self.lr_encode != 1.0 :
+          w_l_r = torch.tensor([1]*(graph_size-self.order_size) + [self.lr_encode**i for i in range(self.order_size)])
+        w_r = torch.ones(graph_size,graph_size) 
+        if self.order_size > 0 and self.lr_encode != 1.0 :
+           w_r = torch.matmul(w_l_r.unsqueeze(1),w_l_r.unsqueeze(0))
+        W_r = w_r.unsqueeze(0).unsqueeze(0).repeat(self.n_heads, batch_size, 1, 1)
 
         # Calculate compatibility (n_heads, batch_size, n_query, graph_size)
         compatibility = self.norm_factor * torch.matmul(Q, K.transpose(2, 3))
+        compatibility = torch.matmul(compatibility,W_r)
 
         # Optionally apply mask to prevent attention
         if mask is not None:
