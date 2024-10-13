@@ -14,8 +14,6 @@ epoch_size: 1280000 -> 128000
 ### 2. options.py
 1. model方面,添加新的 args 设置
 
-epoch_size: 1280000 -> 12800
-
 ### 3. nets/attention_model.py/class AttentionModel
 1. __init__()
 ```py
@@ -79,7 +77,7 @@ epoch_size: 1280000 -> 12800
 ```
 2. Remaining: decode 中的 attention 维持原来的方案
    
-### 4. graph_encoder.py
+### 4. nets/graph_encoder.py
 1. class GraphAttentionEncoder
 ```py
 class GraphAttentionEncoder(nn.Module):
@@ -304,4 +302,94 @@ class MultiHeadAttention(nn.Module):
         return out
 ```
 
-### 
+## 5. 对优先限制 mask 的更改
+###### AttentionModel/_inner()
+```py
+        state = self.problem.make_state(input)
+        state.add_order(self.order_size)
+```
+
+###  problems/tsp/state_tsp.py
+1. constrain
+```py
+    constrain_: torch.Tensor # Keeps track of nodes with constrain (batch,1,n_loc+1)
+    
+    @property
+    def constrain(self):
+        if self.constrain_.dtype == torch.uint8:
+            return self.constrain_[:,:,:-1]
+        else:
+            return mask_long2bool(self.constrain_[:,:,:-1], n=self.loc.size(-2))
+```
+
+2. add_order(order_size)
+```py
+    def add_order(self, order_size):
+        
+        if order_size ==0 :
+            return self
+
+        batch, graph, _ = self.loc.size()
+        order_ = range(0,graph-order_size+1)
+        order = []
+        for i in order_:
+         order += [torch.ones(batch)*(i) ]  
+        constrain_ = self.constrain_
+        device=self.constrain_.device
+        if self.constrain_.dtype == torch.uint8:
+            for selected in order:
+              node = selected[:, None].to(device).to(torch.int64)
+              constrain_ = constrain_.scatter(-1, node[:, :, None], 1)
+        else:
+            for selected in order:
+              node = selected[:, None].to(device).to(torch.int64)
+              constrain_ = mask_long_scatter(constrain_, node)
+
+        return self._replace(constrain_=constrain_)
+```
+
+3. update(selected)
+```py
+    def update(self, selected):
+
+        # Update the state
+        prev_a = selected[:, None]  # Add dimension for step
+
+        # Add the length
+        # cur_coord = self.loc.gather(
+        #     1,
+        #     selected[:, None, None].expand(selected.size(0), 1, self.loc.size(-1))
+        # )[:, 0, :]
+        cur_coord = self.loc[self.ids, prev_a]
+        lengths = self.lengths
+        if self.cur_coord is not None:  # Don't add length for first action (selection of start node)
+            lengths = self.lengths + (cur_coord - self.cur_coord).norm(p=2, dim=-1)  # (batch_dim, 1)
+
+        # Update should only be called with just 1 parallel step, in which case we can check this way if we should update
+        first_a = prev_a if self.i.item() == 0 else self.first_a
+
+        if self.visited_.dtype == torch.uint8:
+            # Add one dimension since we write a single value
+            visited_ = self.visited_.scatter(-1, prev_a[:, :, None], 1)
+        else:
+            visited_ = mask_long_scatter(self.visited_, prev_a)
+
+        refree = selected + 1 
+        refree = refree[:,None]
+        if self.contrain_.dtype == torch.uint8:
+            # Add one dimension since we write a single value
+            contrain_ = self.contrain_.scatter(-1, refree[:, :, None], 1)
+        else:
+            contrain_ = mask_long_scatter(self.contrain_, refree)
+
+        return self._replace(first_a=first_a, prev_a=prev_a, visited_=visited_,
+                             lengths=lengths, cur_coord=cur_coord, i=self.i + 1,
+                             contrain_=contrain_)
+```
+
+4. get_mask()
+```py
+    def get_mask(self):
+        return (self.visited > 0) | (self.constrain < 1)   # Hacky way to return bool or uint8 depending on pytorch version
+```
+
